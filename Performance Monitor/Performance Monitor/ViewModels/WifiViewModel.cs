@@ -1,6 +1,7 @@
 ﻿using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using System;
+using System.Globalization;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -118,18 +119,10 @@ public partial class WifiViewModel : ViewModelBase
             tick++;
             try
             {
-                NetworkInterface? wifiInterface = NetworkInterface.GetAllNetworkInterfaces()
-                    .FirstOrDefault(nic => (nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 ||
-                                            nic.Name.StartsWith("wlan", StringComparison.OrdinalIgnoreCase) ||
-                                            nic.Name.StartsWith("wlp", StringComparison.OrdinalIgnoreCase) ||
-                                            nic.Name.StartsWith("wlx", StringComparison.OrdinalIgnoreCase))
-                                           && nic.OperationalStatus == OperationalStatus.Up);
-
-                wifiInterface ??= NetworkInterface.GetAllNetworkInterfaces()
-                    .FirstOrDefault(nic => nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 ||
-                                           nic.Name.StartsWith("wlan", StringComparison.OrdinalIgnoreCase) ||
-                                           nic.Name.StartsWith("wlp", StringComparison.OrdinalIgnoreCase) ||
-                                           nic.Name.StartsWith("wlx", StringComparison.OrdinalIgnoreCase));
+                var allNics = NetworkInterface.GetAllNetworkInterfaces();
+                NetworkInterface? wifiInterface =
+                    allNics.FirstOrDefault(nic => IsWirelessInterface(nic) && nic.OperationalStatus == OperationalStatus.Up)
+                    ?? allNics.FirstOrDefault(nic => IsWirelessInterface(nic));
 
                 if (wifiInterface == null)
                 {
@@ -249,58 +242,111 @@ public partial class WifiViewModel : ViewModelBase
         }
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
-            string status = "Disconnected";
-            string ssid = "Not connected";
-            string signalStrength = "-";
-            bool detected = false;
-
-            string nmcliOutput = ExecuteCommand("nmcli", "-t -f active,ssid,signal dev wifi");
-            if (!string.IsNullOrWhiteSpace(nmcliOutput))
-            {
-                foreach (var line in nmcliOutput.Split('\n'))
-                {
-                    if (line.StartsWith("yes:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var parts = line.Split(':');
-                        if (parts.Length >= 3)
-                        {
-                            status = "Connected";
-                            ssid = parts[1];
-                            signalStrength = $"📶 {parts[2]}%";
-                            detected = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if (!detected)
-            {
-                string iwOutput = ExecuteCommand("iwconfig", interfaceName);
-
-                var ssidMatch = Regex.Match(iwOutput, @"ESSID:""([^""]+)""");
-                if (ssidMatch.Success)
-                {
-                    status = "Connected";
-                    ssid = ssidMatch.Groups[1].Value;
-                }
-
-                var signalMatch = Regex.Match(iwOutput, @"Link Quality=(\d+/\d+)");
-                signalStrength = signalMatch.Success ? $"📶 {signalMatch.Groups[1].Value}" : "-";
-            }
-
-            string iwDevOutput = ExecuteCommand("iw", $"dev {interfaceName} link");
-            var freqMatch = Regex.Match(iwDevOutput, @"freq:\s*(\d+)");
-            string connectionType = freqMatch.Success && int.TryParse(freqMatch.Groups[1].Value, out int freq)
-                ? (freq > 5000 ? "802.11ac/ax (5GHz)" : "802.11n/ax (2.4GHz)")
-                : "802.11 Wireless";
-
-            return new WifiDetails(status, ssid, connectionType, signalStrength);
+            return GetLinuxWifiDetails(interfaceName);
         }
         else
         {
             return new WifiDetails("Connected", "Connected", "802.11", "📶 Connected");
         }
+    }
+
+    // Recognises wireless NICs across naming schemes (wlan0, wlp3s0, wlx<mac>, wlo1, ...).
+    // On Linux the kernel also marks wireless devices with a /sys/class/net/<name>/wireless directory.
+    private static bool IsWirelessInterface(NetworkInterface nic)
+    {
+        if (nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211) return true;
+        if (nic.Name.StartsWith("wl", StringComparison.OrdinalIgnoreCase)) return true;
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) &&
+                Directory.Exists($"/sys/class/net/{nic.Name}/wireless"))
+                return true;
+        }
+        catch { }
+        return false;
+    }
+
+    private static string BandLabel(int freqMhz) =>
+        freqMhz > 5900 ? "802.11ax (6GHz)" :
+        freqMhz > 4900 ? "802.11ac/ax (5GHz)" :
+        freqMhz > 0 ? "802.11n/ax (2.4GHz)" :
+        "802.11 Wireless";
+
+    // Rough dBm -> % conversion (the same mapping NetworkManager uses).
+    private static int DbmToPercent(double dbm) => (int)Math.Clamp(2 * (dbm + 100), 0, 100);
+
+    // nmcli's terse mode separates fields with ':' and escapes a literal ':' or '\' with a backslash,
+    // so an SSID such as "Cafe:Guest" must not be split on its own colon.
+    private static System.Collections.Generic.List<string> SplitTerse(string line)
+    {
+        var fields = new System.Collections.Generic.List<string>();
+        var cur = new System.Text.StringBuilder();
+        for (int i = 0; i < line.Length; i++)
+        {
+            char c = line[i];
+            if (c == '\\' && i + 1 < line.Length) { cur.Append(line[++i]); }
+            else if (c == ':') { fields.Add(cur.ToString()); cur.Clear(); }
+            else cur.Append(c);
+        }
+        fields.Add(cur.ToString());
+        return fields;
+    }
+
+    private WifiDetails GetLinuxWifiDetails(string iface)
+    {
+        // 1. NetworkManager, restricted to this interface.
+        string nm = ExecuteCommand("nmcli", $"-t -f active,ssid,signal,freq dev wifi list ifname {iface}");
+        foreach (var raw in nm.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var f = SplitTerse(raw.Trim());
+            if (f.Count >= 4 && f[0].Equals("yes", StringComparison.OrdinalIgnoreCase))
+            {
+                string ssid = string.IsNullOrWhiteSpace(f[1]) ? "Connected" : f[1];
+                string signal = int.TryParse(f[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int pct) ? $"📶 {pct}%" : "-";
+                var freqMatch = Regex.Match(f[3], @"\d+");
+                int freq = freqMatch.Success ? int.Parse(freqMatch.Value, CultureInfo.InvariantCulture) : 0;
+                return new WifiDetails("Connected", ssid, BandLabel(freq), signal);
+            }
+        }
+
+        // 2. iw (no NetworkManager needed).
+        string iw = ExecuteCommand("iw", $"dev {iface} link");
+        if (!string.IsNullOrWhiteSpace(iw) && !iw.Contains("Not connected", StringComparison.OrdinalIgnoreCase))
+        {
+            var ssidM = Regex.Match(iw, @"^\s*SSID:\s*(.+)$", RegexOptions.Multiline);
+            var freqM = Regex.Match(iw, @"freq:\s*(\d+)");
+            var sigM = Regex.Match(iw, @"signal:\s*(-?\d+(?:\.\d+)?)\s*dBm");
+            if (ssidM.Success || freqM.Success)
+            {
+                int freq = freqM.Success ? int.Parse(freqM.Groups[1].Value, CultureInfo.InvariantCulture) : 0;
+                string signal = sigM.Success &&
+                                double.TryParse(sigM.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out double dbm)
+                    ? $"📶 {DbmToPercent(dbm)}%" : "-";
+                return new WifiDetails("Connected", ssidM.Success ? ssidM.Groups[1].Value.Trim() : "Connected", BandLabel(freq), signal);
+            }
+        }
+
+        // 3. Legacy wireless-tools.
+        string iwc = ExecuteCommand("iwconfig", iface);
+        var essid = Regex.Match(iwc, "ESSID:\"([^\"]+)\"");
+        if (essid.Success)
+        {
+            var q = Regex.Match(iwc, @"Link Quality=(\d+)/(\d+)");
+            string signal = "-";
+            if (q.Success &&
+                double.TryParse(q.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out double num) &&
+                double.TryParse(q.Groups[2].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out double den) && den > 0)
+                signal = $"📶 {(int)Math.Round(num / den * 100)}%";
+
+            var fr = Regex.Match(iwc, @"Frequency[:=](\d+(?:\.\d+)?)\s*GHz");
+            int freq = fr.Success &&
+                       double.TryParse(fr.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out double ghz)
+                ? (int)Math.Round(ghz * 1000) : 0;
+
+            return new WifiDetails("Connected", essid.Groups[1].Value, BandLabel(freq), signal);
+        }
+
+        return new WifiDetails("Disconnected", "Not connected", "-", "-");
     }
 
     private void PostResetToDisconnectedState(string adapter)
@@ -337,10 +383,19 @@ public partial class WifiViewModel : ViewModelBase
                 }
             };
 
-            process.Start();
-            string result = process.StandardOutput.ReadToEnd();
-            process.WaitForExit(2000);
-            return result;
+            using (process)
+            {
+                process.Start();
+                // Read asynchronously so a hung tool (e.g. nvidia-smi with a broken driver) can
+                // never block the monitoring loop forever.
+                var output = process.StandardOutput.ReadToEndAsync();
+                if (!process.WaitForExit(2000))
+                {
+                    try { process.Kill(true); } catch { }
+                    return string.Empty;
+                }
+                return output.Wait(1000) ? output.Result : string.Empty;
+            }
         }
         catch
         {

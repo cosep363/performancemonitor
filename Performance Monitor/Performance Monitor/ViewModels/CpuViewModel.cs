@@ -2,6 +2,7 @@
 using CommunityToolkit.Mvvm.ComponentModel;
 using System;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Management;
@@ -14,6 +15,8 @@ namespace TaskManager.ViewModels;
 public partial class CpuViewModel : ViewModelBase
 {
     private PerformanceCounter? _cpuCounter;
+    private ulong _prevCpuIdle;
+    private ulong _prevCpuTotal;
 
     private string _cpuName = "Detecting CPU...";
     public string CpuName
@@ -233,64 +236,135 @@ public partial class CpuViewModel : ViewModelBase
     {
         try
         {
+            string lscpu = ExecuteCommand("lscpu", "");
+            var lscpuMap = new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var line in lscpu.Split('\n'))
+            {
+                int idx = line.IndexOf(':');
+                if (idx > 0) lscpuMap[line.Substring(0, idx).Trim()] = line.Substring(idx + 1).Trim();
+            }
+
+            var physicalIds = new System.Collections.Generic.HashSet<string>();
+            int logical = 0;
+            int coresPerSocket = 0;
+            bool hasVirtFlag = false;
+            string? modelName = null;
+
             if (File.Exists("/proc/cpuinfo"))
             {
-                string[] lines = File.ReadAllLines("/proc/cpuinfo");
-                int coreCount = 0;
-
-                foreach (string line in lines)
+                foreach (string line in File.ReadLines("/proc/cpuinfo"))
                 {
-                    if (line.StartsWith("model name", StringComparison.OrdinalIgnoreCase) && CpuName.Contains("Detecting"))
-                    {
-                        var parts = line.Split(':');
-                        if (parts.Length > 1) CpuName = parts[1].Trim();
-                    }
-                    else if (line.StartsWith("cpu cores", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var parts = line.Split(':');
-                        if (parts.Length > 1 && int.TryParse(parts[1].Trim(), out int cores))
-                            Cores = cores.ToString();
-                    }
-                    else if (line.StartsWith("processor", StringComparison.OrdinalIgnoreCase))
-                    {
-                        coreCount++;
-                    }
-                    else if (line.StartsWith("cpu MHz", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var parts = line.Split(':');
-                        if (parts.Length > 1 && double.TryParse(parts[1].Trim(), out double mhz))
-                            BaseSpeed = $"{mhz / 1000.0:F2} GHz";
-                    }
-                }
+                    int idx = line.IndexOf(':');
+                    if (idx < 0) continue;
+                    string key = line.Substring(0, idx).Trim();
+                    string val = line.Substring(idx + 1).Trim();
 
-                if (coreCount > 0)
-                    LogicalProcessors = coreCount.ToString();
-            }
-
-            string lscpu = ExecuteCommand("lscpu", "");
-            if (!string.IsNullOrEmpty(lscpu))
-            {
-                if (lscpu.Contains("Virtualization:") || lscpu.Contains("VT-x") || lscpu.Contains("AMD-V"))
-                    Virtualization = "Enabled";
-                else
-                    Virtualization = "Disabled";
-
-                // Extract L1d/L1i cache if available from lscpu output
-                foreach (var line in lscpu.Split('\n'))
-                {
-                    if (line.StartsWith("L1d cache:") || line.StartsWith("L1i cache:"))
-                    {
-                        var parts = line.Split(':');
-                        if (parts.Length > 1)
-                            L1Cache = parts[1].Trim();
-                    }
+                    if (key.Equals("processor", StringComparison.OrdinalIgnoreCase)) logical++;
+                    else if (key.Equals("model name", StringComparison.OrdinalIgnoreCase) && modelName == null) modelName = val;
+                    else if (key.Equals("physical id", StringComparison.OrdinalIgnoreCase)) physicalIds.Add(val);
+                    else if (key.Equals("cpu cores", StringComparison.OrdinalIgnoreCase) && coresPerSocket == 0)
+                        int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out coresPerSocket);
+                    else if (key.Equals("flags", StringComparison.OrdinalIgnoreCase) && !hasVirtFlag)
+                        hasVirtFlag = (" " + val + " ").Contains(" vmx ") || (" " + val + " ").Contains(" svm ");
                 }
             }
+
+            // ARM and some other architectures have no "model name" in /proc/cpuinfo.
+            if (string.IsNullOrWhiteSpace(modelName) && lscpuMap.TryGetValue("Model name", out var lm)) modelName = lm;
+            if (!string.IsNullOrWhiteSpace(modelName)) CpuName = modelName!;
+            else CpuName = "Linux Processor";
+
+            if (logical == 0) logical = Environment.ProcessorCount;
+            LogicalProcessors = logical.ToString();
+
+            int sockets = physicalIds.Count > 0 ? physicalIds.Count : 1;
+            if (lscpuMap.TryGetValue("Socket(s)", out var sockText) &&
+                int.TryParse(sockText, NumberStyles.Integer, CultureInfo.InvariantCulture, out int lscpuSockets) && lscpuSockets > 0)
+                sockets = lscpuSockets;
+            Sockets = sockets.ToString();
+
+            if (coresPerSocket == 0 && lscpuMap.TryGetValue("Core(s) per socket", out var cpsText))
+                int.TryParse(cpsText, NumberStyles.Integer, CultureInfo.InvariantCulture, out coresPerSocket);
+            Cores = coresPerSocket > 0 ? (coresPerSocket * sockets).ToString() : logical.ToString();
+
+            // Max (base) frequency: sysfs is in kHz; lscpu reports MHz with a locale-dependent decimal.
+            double? maxMhz = null;
+            string maxFreqPath = "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq";
+            if (File.Exists(maxFreqPath) &&
+                double.TryParse(File.ReadAllText(maxFreqPath).Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out double khz))
+                maxMhz = khz / 1000.0;
+            else if (lscpuMap.TryGetValue("CPU max MHz", out var maxText) &&
+                     double.TryParse(maxText.Replace(',', '.'), NumberStyles.Float, CultureInfo.InvariantCulture, out double lmhz))
+                maxMhz = lmhz;
+
+            double? curMhz = ReadLinuxCurrentMhz();
+            double? shown = maxMhz ?? curMhz;
+            if (shown.HasValue) BaseSpeed = $"{shown.Value / 1000.0:F2} GHz";
+            if (curMhz.HasValue) Speed = $"{curMhz.Value / 1000.0:F2} GHz";
+            else if (shown.HasValue) Speed = BaseSpeed;
+
+            // Virtualization: CPU flag is the most reliable signal; fall back to lscpu.
+            if (hasVirtFlag || lscpuMap.ContainsKey("Virtualization"))
+                Virtualization = "Enabled";
+            else
+                Virtualization = "Disabled";
+
+            // lscpu reports cache totals, e.g. "192 KiB (4 instances)".
+            string l1d = lscpuMap.TryGetValue("L1d cache", out var a) ? a : "";
+            string l1i = lscpuMap.TryGetValue("L1i cache", out var b) ? b : "";
+            if (l1d.Length > 0 && l1i.Length > 0) L1Cache = $"{l1d} + {l1i}";
+            else if (l1d.Length > 0 || l1i.Length > 0) L1Cache = l1d.Length > 0 ? l1d : l1i;
+            if (lscpuMap.TryGetValue("L2 cache", out var l2)) L2Cache = l2;
+            if (lscpuMap.TryGetValue("L3 cache", out var l3)) L3Cache = l3;
         }
         catch
         {
             CpuName = "Linux Processor";
         }
+    }
+
+    // Average current frequency across cores in MHz (sysfs kHz), falling back to /proc/cpuinfo.
+    private static double? ReadLinuxCurrentMhz()
+    {
+        try
+        {
+            const string root = "/sys/devices/system/cpu";
+            double sum = 0;
+            int n = 0;
+            if (Directory.Exists(root))
+            {
+                foreach (var dir in Directory.EnumerateDirectories(root, "cpu*"))
+                {
+                    string name = Path.GetFileName(dir);
+                    if (name.Length < 4 || !char.IsDigit(name[3])) continue;
+                    string f = Path.Combine(dir, "cpufreq", "scaling_cur_freq");
+                    if (File.Exists(f) &&
+                        double.TryParse(File.ReadAllText(f).Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out double khz))
+                    {
+                        sum += khz / 1000.0;
+                        n++;
+                    }
+                }
+            }
+            if (n > 0) return sum / n;
+
+            if (File.Exists("/proc/cpuinfo"))
+            {
+                foreach (var line in File.ReadLines("/proc/cpuinfo"))
+                {
+                    if (!line.StartsWith("cpu MHz", StringComparison.OrdinalIgnoreCase)) continue;
+                    int idx = line.IndexOf(':');
+                    if (idx > 0 && double.TryParse(line.Substring(idx + 1).Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out double mhz))
+                    {
+                        sum += mhz;
+                        n++;
+                    }
+                }
+            }
+            if (n > 0) return sum / n;
+        }
+        catch { }
+        return null;
     }
 
     private async Task StartMonitoringAsync()
@@ -322,6 +396,17 @@ public partial class CpuViewModel : ViewModelBase
 
                 // 2. System Uptime (cheap)
                 TimeSpan uptimeSpan = TimeSpan.FromMilliseconds(Environment.TickCount64);
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+                {
+                    // /proc/uptime includes time spent suspended; TickCount64 does not.
+                    try
+                    {
+                        var up = File.ReadAllText("/proc/uptime").Split(' ')[0];
+                        if (double.TryParse(up, NumberStyles.Float, CultureInfo.InvariantCulture, out double secs))
+                            uptimeSpan = TimeSpan.FromSeconds(secs);
+                    }
+                    catch { }
+                }
                 string uptimeText = $"{uptimeSpan.Days}:{uptimeSpan.Hours:D2}:{uptimeSpan.Minutes:D2}:{uptimeSpan.Seconds:D2}";
 
                 // 3. Processes, Threads & Handles - this enumerates every process on the
@@ -354,6 +439,18 @@ public partial class CpuViewModel : ViewModelBase
 
                         threadsText = threadCount.ToString();
                         handlesText = handleCount > 0 ? handleCount.ToString() : "N/A";
+
+                        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+                        {
+                            // System-wide allocated file handles: first field of /proc/sys/fs/file-nr.
+                            try
+                            {
+                                var fields = File.ReadAllText("/proc/sys/fs/file-nr").Split(new[] { '\t', ' ', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                                if (fields.Length > 0 && long.TryParse(fields[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out long fh))
+                                    handlesText = fh.ToString();
+                            }
+                            catch { }
+                        }
                     }
                     finally
                     {
@@ -365,12 +462,20 @@ public partial class CpuViewModel : ViewModelBase
                     }
                 }
 
+                string? speedText = null;
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && tick % 2 == 1)
+                {
+                    double? mhz = ReadLinuxCurrentMhz();
+                    if (mhz.HasValue) speedText = $"{mhz.Value / 1000.0:F2} GHz";
+                }
+
                 // Only the final, cheap property assignments touch the UI thread.
                 Dispatcher.UIThread.Post(() =>
                 {
                     UtilizationValue = cpuPercent;
                     Utilization = $"{cpuPercent}%";
                     Uptime = uptimeText;
+                    if (speedText != null) Speed = speedText;
 
                     if (processesText != null) Processes = processesText;
                     if (threadsText != null) Threads = threadsText;
@@ -381,6 +486,8 @@ public partial class CpuViewModel : ViewModelBase
         }
     }
 
+    // /proc/stat counters are cumulative since boot, so usage must be computed from the
+    // change between two samples rather than from a single reading.
     private float GetLinuxCpuUsage()
     {
         try
@@ -389,16 +496,28 @@ public partial class CpuViewModel : ViewModelBase
             {
                 string firstLine = File.ReadLines("/proc/stat").First();
                 var parts = firstLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                // cpu user nice system idle iowait irq softirq steal [guest guest_nice]
                 if (parts.Length >= 5)
                 {
-                    ulong idle = ulong.Parse(parts[4]);
                     ulong total = 0;
-                    for (int i = 1; i < parts.Length; i++)
+                    // guest/guest_nice are already included in user/nice, so stop at steal (index 8).
+                    for (int i = 1; i < parts.Length && i <= 8; i++)
                     {
-                        if (ulong.TryParse(parts[i], out ulong val)) total += val;
+                        if (ulong.TryParse(parts[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out ulong val)) total += val;
                     }
 
-                    return (float)Math.Clamp((1.0 - ((double)idle / Math.Max(total, 1))) * 100, 0, 100);
+                    ulong idle = ulong.Parse(parts[4], CultureInfo.InvariantCulture);
+                    if (parts.Length > 5 && ulong.TryParse(parts[5], NumberStyles.Integer, CultureInfo.InvariantCulture, out ulong iowait))
+                        idle += iowait;
+
+                    ulong dTotal = total - _prevCpuTotal;
+                    ulong dIdle = idle - _prevCpuIdle;
+                    bool first = _prevCpuTotal == 0;
+                    _prevCpuTotal = total;
+                    _prevCpuIdle = idle;
+
+                    if (first || total < dTotal || dTotal == 0) return 0;
+                    return (float)Math.Clamp((1.0 - (double)dIdle / dTotal) * 100.0, 0, 100);
                 }
             }
         }
@@ -421,10 +540,19 @@ public partial class CpuViewModel : ViewModelBase
                     CreateNoWindow = true
                 }
             };
-            process.Start();
-            string result = process.StandardOutput.ReadToEnd();
-            process.WaitForExit(500);
-            return result;
+            using (process)
+            {
+                process.Start();
+                // Read asynchronously so a hung tool (e.g. nvidia-smi with a broken driver) can
+                // never block the monitoring loop forever.
+                var output = process.StandardOutput.ReadToEndAsync();
+                if (!process.WaitForExit(1500))
+                {
+                    try { process.Kill(true); } catch { }
+                    return string.Empty;
+                }
+                return output.Wait(1000) ? output.Result : string.Empty;
+            }
         }
         catch
         {
