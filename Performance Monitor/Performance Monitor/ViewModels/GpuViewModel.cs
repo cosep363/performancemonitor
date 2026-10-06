@@ -448,6 +448,7 @@ public partial class GpuViewModel : ViewModelBase
                     if (hasTemp) Temperature = $"{temp} °C";
                     if (memText != null) MemoryUsage = memText;
                 });
+
                 return;
             }
         }
@@ -458,7 +459,45 @@ public partial class GpuViewModel : ViewModelBase
             if (_drmDevicePath == null) return;
 
             // amdgpu exposes busy %, VRAM and GTT (shared) usage; Intel/Nouveau expose little or none of it.
-            bool hasUtil = TryParseDouble(ReadSysfs(Path.Combine(_drmDevicePath, "gpu_busy_percent")), out double util);
+            // Try multiple possible paths for GPU utilization
+            bool hasUtil = false;
+            double util = 0;
+            
+            // Try the standard amdgpu path first
+            if (!hasUtil)
+                hasUtil = TryParseDouble(ReadSysfs(Path.Combine(_drmDevicePath, "gpu_busy_percent")), out util);
+            
+            // Fallback: try reading from debugfs (if available and readable)
+            if (!hasUtil)
+            {
+                string? debugPath = Path.Combine(_drmDevicePath, "../../debugfs");
+                if (Directory.Exists(debugPath))
+                {
+                    var debugFile = Path.Combine(debugPath, "amdgpu_pm_info");
+                    if (File.Exists(debugFile))
+                    {
+                        try
+                        {
+                            string content = File.ReadAllText(debugFile);
+                            foreach (var line in content.Split('\n'))
+                            {
+                                if (line.Contains("GPU Load") && line.Contains("%"))
+                                {
+                                    var match = System.Text.RegularExpressions.Regex.Match(line, @"(\d+)\s*%");
+                                    if (match.Success && double.TryParse(match.Groups[1].Value, out double dbgUtil))
+                                    {
+                                        util = dbgUtil;
+                                        hasUtil = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+
             double? temp = ReadDrmTemperatureC(_drmDevicePath);
 
             string? vramText = null;

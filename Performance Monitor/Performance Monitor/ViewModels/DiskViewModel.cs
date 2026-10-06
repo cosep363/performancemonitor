@@ -513,6 +513,11 @@ public partial class DiskViewModel : ViewModelBase
                                         AverageResponseTime = responseText;
                                     });
                                 }
+                                else
+                                {
+                                    // Initialize baseline on first successful read
+                                    havePrev = true;
+                                }
 
                                 lastReadBytes = currentReadBytes;
                                 lastWriteBytes = currentWriteBytes;
@@ -520,7 +525,6 @@ public partial class DiskViewModel : ViewModelBase
                                 prevReadMs = readMs; prevWriteMs = writeMs;
                                 prevIoTicksMs = ioTicksMs;
                                 prevClockMs = nowMs;
-                                havePrev = true;
                             }
                         }
                     }
