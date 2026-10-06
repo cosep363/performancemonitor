@@ -342,14 +342,14 @@
 
                         <!-- Header & Adapter Model -->
                         <Grid Grid.Row="0" ColumnDefinitions="Auto, *" Margin="0,0,0,10">
-                            <TextBlock Text="Wi-Fi" FontSize="32" FontWeight="Bold" Foreground="White" Margin="0,0,20,0"/>
+                            <TextBlock Text="{Binding TabTitle}" FontSize="32" FontWeight="Bold" Foreground="White" Margin="0,0,20,0"/>
                             <TextBlock Grid.Column="1" Text="{Binding AdapterName}" FontSize="18" Foreground="#E1E1E1" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
                         </Grid>
 
                         <!-- Throughput Section Header -->
                         <Grid Grid.Row="1" ColumnDefinitions="*, Auto" Margin="0,0,0,5">
                             <TextBlock Text="Throughput" FontSize="12" Foreground="#888888"/>
-                            <TextBlock Grid.Column="1" Text="100 Kbps" FontSize="12" Foreground="#888888"/>
+                            <TextBlock Grid.Column="1" Text="{Binding GraphMaxLabel}" FontSize="12" Foreground="#888888"/>
                         </Grid>
 
                         <!-- Network Graph Area -->
@@ -357,9 +357,9 @@
                             <Grid RowDefinitions="*, Auto">
                                 <StackPanel VerticalAlignment="Center" Spacing="8">
                                     <!-- Send Bar -->
-                                    <ProgressBar Value="{Binding SendValue}" Minimum="0" Maximum="100" Height="10" Foreground="#D63031" Background="#1E272C" CornerRadius="2"/>
+                                    <ProgressBar Value="{Binding SendValue}" Minimum="0" Maximum="{Binding GraphMax}" Height="10" Foreground="#D63031" Background="#1E272C" CornerRadius="2"/>
                                     <!-- Receive Bar -->
-                                    <ProgressBar Value="{Binding ReceiveValue}" Minimum="0" Maximum="100" Height="10" Foreground="#1289A7" Background="#1E272C" CornerRadius="2"/>
+                                    <ProgressBar Value="{Binding ReceiveValue}" Minimum="0" Maximum="{Binding GraphMax}" Height="10" Foreground="#1289A7" Background="#1E272C" CornerRadius="2"/>
                                 </StackPanel>
                                 <Grid Grid.Row="1" ColumnDefinitions="*, Auto" Margin="0,10,0,0">
                                     <TextBlock Text="60 seconds" FontSize="11" Foreground="#666666"/>
@@ -388,11 +388,11 @@
                             <Grid Grid.Column="1" ColumnDefinitions="Auto, *" Margin="20,0,0,0">
                                 <StackPanel Grid.Column="0" Spacing="6">
                                     <TextBlock Text="Adapter name:" Foreground="#888888"/>
-                                    <TextBlock Text="SSID:" Foreground="#888888"/>
+                                    <TextBlock Text="{Binding SsidLabel}" Foreground="#888888"/>
                                     <TextBlock Text="Connection type:" Foreground="#888888"/>
                                     <TextBlock Text="IPv4 address:" Foreground="#888888"/>
                                     <TextBlock Text="IPv6 address:" Foreground="#888888"/>
-                                    <TextBlock Text="Signal strength:" Foreground="#888888"/>
+                                    <TextBlock Text="{Binding SignalLabel}" Foreground="#888888"/>
                                 </StackPanel>
 
                                 <StackPanel Grid.Column="1" Margin="20,0,0,0" Spacing="6" HorizontalAlignment="Left">

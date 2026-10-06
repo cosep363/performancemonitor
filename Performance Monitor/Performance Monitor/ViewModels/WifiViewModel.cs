@@ -1,6 +1,8 @@
 ﻿using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using System;
+using System.Collections.Generic;
+using System.Net;
 using System.Globalization;
 using System.Diagnostics;
 using System.IO;
@@ -93,7 +95,71 @@ public partial class WifiViewModel : ViewModelBase
         set => SetProperty(ref _signalStrength, value);
     }
 
-    public string AdapterNameLabel { get; } = "Wi-Fi";
+    // "Adapter name" row: "Wi-Fi" in Wi-Fi mode, the interface name (eth0, enp4s0...) in Ethernet mode.
+    private string _adapterNameLabel = "Wi-Fi";
+    public string AdapterNameLabel
+    {
+        get => _adapterNameLabel;
+        set => SetProperty(ref _adapterNameLabel, value);
+    }
+
+    // The tab heading switches between Wi-Fi / Ethernet depending on which connection is in use.
+    private string _tabTitle = "Wi-Fi";
+    public string TabTitle
+    {
+        get => _tabTitle;
+        set => SetProperty(ref _tabTitle, value);
+    }
+
+    // SSID / Signal strength make no sense for a cable, so they become Status / Link speed.
+    private string _ssidLabel = "SSID:";
+    public string SsidLabel
+    {
+        get => _ssidLabel;
+        set => SetProperty(ref _ssidLabel, value);
+    }
+
+    private string _signalLabel = "Signal strength:";
+    public string SignalLabel
+    {
+        get => _signalLabel;
+        set => SetProperty(ref _signalLabel, value);
+    }
+
+    // Throughput graph scale in kbps. Auto-scales to the recent peak so wired speeds don't peg the bars.
+    private double _graphMax = 100;
+    public double GraphMax
+    {
+        get => _graphMax;
+        set => SetProperty(ref _graphMax, value);
+    }
+
+    private string _graphMaxLabel = "100 Kbps";
+    public string GraphMaxLabel
+    {
+        get => _graphMaxLabel;
+        set => SetProperty(ref _graphMaxLabel, value);
+    }
+
+    private enum NetMode { WiFi, Ethernet }
+
+    // Must be called on the UI thread.
+    private void ApplyMode(NetMode mode, string? title = null)
+    {
+        if (mode == NetMode.Ethernet)
+        {
+            TabTitle = title ?? "Ethernet";
+            SsidLabel = "Status:";
+            SignalLabel = "Link speed:";
+        }
+        else
+        {
+            TabTitle = title ?? "Wi-Fi";
+            SsidLabel = "SSID:";
+            SignalLabel = "Signal strength:";
+            AdapterNameLabel = "Wi-Fi";
+        }
+    }
 
     public WifiViewModel()
     {
@@ -102,93 +168,129 @@ public partial class WifiViewModel : ViewModelBase
 
     private async Task StartNetworkMonitoringAsync()
     {
+        string? lastIface = null;
         long oldBytesSent = 0;
         long oldBytesReceived = 0;
+        bool havePrev = false;
+        long prevMs = 0;
+        var clock = Stopwatch.StartNew();
+        var history = new Queue<double>(); // last 60 samples of max(send, receive) in kbps, for graph scaling
         int tick = 0;
 
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
 
-        // Resume off the UI thread. UpdateWifiDetails() can spawn 1-3 external
-        // processes (netsh / nmcli / iwconfig / iw), each of which is allowed to
-        // block for up to 2 seconds waiting for the process to exit - previously
-        // that ran synchronously on the UI thread every single second, which was
-        // by far the biggest contributor to the app stuttering while its window
-        // was being dragged.
+        // Resume off the UI thread. GetWifiDetails() can spawn 1-3 external processes
+        // (netsh / nmcli / iw / iwconfig), each allowed to block for a while, and that
+        // used to run on the UI thread every second and make the window stutter.
         while (await timer.WaitForNextTickAsync().ConfigureAwait(false))
         {
             tick++;
             try
             {
                 var allNics = NetworkInterface.GetAllNetworkInterfaces();
-                NetworkInterface? wifiInterface =
-                    allNics.FirstOrDefault(nic => IsWirelessInterface(nic) && nic.OperationalStatus == OperationalStatus.Up)
-                    ?? allNics.FirstOrDefault(nic => IsWirelessInterface(nic));
+                var wifiUp = allNics.FirstOrDefault(nic => IsWirelessInterface(nic) && nic.OperationalStatus == OperationalStatus.Up);
+                var wiredUp = PickWiredInterface(allNics);
 
-                if (wifiInterface == null)
+                NetworkInterface active;
+                NetMode mode;
+
+                if (wifiUp != null && wiredUp != null)
                 {
-                    PostResetToDisconnectedState("Wi-Fi Adapter Not Found");
-                    oldBytesSent = 0;
-                    oldBytesReceived = 0;
+                    // Both connected: show the one that carries the default route. Wi-Fi wins a tie.
+                    bool wiredOnly = HasIPv4Gateway(wiredUp) && !HasIPv4Gateway(wifiUp);
+                    active = wiredOnly ? wiredUp : wifiUp;
+                    mode = wiredOnly ? NetMode.Ethernet : NetMode.WiFi;
+                }
+                else if (wifiUp != null) { active = wifiUp; mode = NetMode.WiFi; }
+                else if (wiredUp != null) { active = wiredUp; mode = NetMode.Ethernet; }
+                else
+                {
+                    // Nothing connected: describe whichever kind of adapter exists but is down.
+                    var wifiAny = allNics.FirstOrDefault(IsWirelessInterface);
+                    var wiredAny = allNics.FirstOrDefault(IsWiredCandidate);
+                    if (wifiAny != null) PostResetToDisconnectedState(DescribeAdapter(wifiAny), NetMode.WiFi, null);
+                    else if (wiredAny != null) PostResetToDisconnectedState(DescribeAdapter(wiredAny), NetMode.Ethernet, null);
+                    else PostResetToDisconnectedState("No network adapter found", NetMode.WiFi, "Network");
+
+                    lastIface = null;
+                    havePrev = false;
+                    history.Clear();
                     continue;
                 }
 
-                string adapterName = string.IsNullOrWhiteSpace(wifiInterface.Description)
-                    ? wifiInterface.Name
-                    : wifiInterface.Description;
+                string adapterName = DescribeAdapter(active);
 
-                if (wifiInterface.OperationalStatus != OperationalStatus.Up)
+                // Restart sampling when the monitored interface changes, so switching between
+                // Wi-Fi and Ethernet doesn't produce a bogus throughput spike.
+                bool ifaceChanged = active.Name != lastIface;
+                if (ifaceChanged)
                 {
-                    PostResetToDisconnectedState(adapterName);
-                    oldBytesSent = 0;
-                    oldBytesReceived = 0;
-                    continue;
+                    havePrev = false;
+                    history.Clear();
+                    lastIface = active.Name;
                 }
 
-                // Adapter/SSID/signal details require spawning an external process -
-                // that's expensive and doesn't change second-to-second, so refresh
-                // it only every 5th tick. Bandwidth (below) still updates every tick,
-                // since it's cheap (pure managed NetworkInterface API, no subprocess).
-                WifiDetails? details = tick % 5 == 1 ? GetWifiDetails(wifiInterface.Name) : null;
+                // Wi-Fi details need a subprocess, so refresh them every 5th tick. Ethernet details
+                // are read from the managed API and are cheap.
+                WifiDetails? details = null;
+                if (mode == NetMode.WiFi)
+                {
+                    if (tick % 5 == 1 || ifaceChanged) details = GetWifiDetails(active.Name);
+                }
+                else
+                {
+                    details = GetEthernetDetails(active);
+                }
 
-                var ipProps = wifiInterface.GetIPProperties();
-                var ipv4 = ipProps.UnicastAddresses
-                    .FirstOrDefault(ip => ip.Address.AddressFamily == AddressFamily.InterNetwork);
-                var ipv6 = ipProps.UnicastAddresses
-                    .FirstOrDefault(ip => ip.Address.AddressFamily == AddressFamily.InterNetworkV6);
-
+                var ipProps = active.GetIPProperties();
+                var ipv4 = ipProps.UnicastAddresses.FirstOrDefault(ip => ip.Address.AddressFamily == AddressFamily.InterNetwork);
+                var ipv6 = ipProps.UnicastAddresses.FirstOrDefault(ip => ip.Address.AddressFamily == AddressFamily.InterNetworkV6);
                 string ipv4Text = ipv4?.Address.ToString() ?? "-";
                 string ipv6Text = ipv6?.Address.ToString() ?? "-";
 
-                IPv4InterfaceStatistics stats = wifiInterface.GetIPv4Statistics();
+                IPv4InterfaceStatistics stats = active.GetIPv4Statistics();
                 long newBytesSent = stats.BytesSent;
                 long newBytesReceived = stats.BytesReceived;
+                long nowMs = clock.ElapsedMilliseconds;
 
                 string? sendSpeedText = null, receiveSpeedText = null;
                 double? sendValue = null, receiveValue = null;
 
-                if (oldBytesSent > 0 && oldBytesReceived > 0)
+                if (havePrev)
                 {
-                    long bytesSentPerSec = Math.Max(0, newBytesSent - oldBytesSent);
-                    long bytesReceivedPerSec = Math.Max(0, newBytesReceived - oldBytesReceived);
-
-                    double bitsSentPerSec = bytesSentPerSec * 8;
-                    double bitsReceivedPerSec = bytesReceivedPerSec * 8;
+                    double elapsedSec = Math.Max((nowMs - prevMs) / 1000.0, 0.001);
+                    double bitsSentPerSec = Math.Max(0, newBytesSent - oldBytesSent) * 8 / elapsedSec;
+                    double bitsReceivedPerSec = Math.Max(0, newBytesReceived - oldBytesReceived) * 8 / elapsedSec;
 
                     sendValue = bitsSentPerSec / 1000.0;
                     receiveValue = bitsReceivedPerSec / 1000.0;
-
                     sendSpeedText = FormatBitrate(bitsSentPerSec);
                     receiveSpeedText = FormatBitrate(bitsReceivedPerSec);
+
+                    history.Enqueue(Math.Max(sendValue.Value, receiveValue.Value));
+                    while (history.Count > 60) history.Dequeue();
                 }
 
                 oldBytesSent = newBytesSent;
                 oldBytesReceived = newBytesReceived;
+                prevMs = nowMs;
+                havePrev = true;
+
+                double graphMax = GraphScaleFor(history.Count > 0 ? history.Max() : 0);
+                string graphMaxText = FormatBitrate(graphMax * 1000.0);
+                bool wired = mode == NetMode.Ethernet;
+                string ifaceName = active.Name;
 
                 Dispatcher.UIThread.Post(() =>
                 {
+                    if (ifaceChanged) ApplyMode(mode);
+                    if (wired) AdapterNameLabel = ifaceName;
+
                     AdapterName = adapterName;
                     Ipv4Address = ipv4Text;
                     Ipv6Address = ipv6Text;
+                    GraphMax = graphMax;
+                    GraphMaxLabel = graphMaxText;
 
                     if (sendValue.HasValue) SendValue = sendValue.Value;
                     if (receiveValue.HasValue) ReceiveValue = receiveValue.Value;
@@ -206,9 +308,21 @@ public partial class WifiViewModel : ViewModelBase
             }
             catch
             {
-                PostResetToDisconnectedState("Wi-Fi");
+                PostResetToDisconnectedState("Wi-Fi", NetMode.WiFi, null);
             }
         }
+    }
+
+    private static string DescribeAdapter(NetworkInterface nic)
+        => string.IsNullOrWhiteSpace(nic.Description) ? nic.Name : nic.Description;
+
+    // Smallest round scale (kbps) that fits the recent peak.
+    private static double GraphScaleFor(double peakKbps)
+    {
+        double[] steps = { 100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000, 10_000_000 };
+        foreach (double step in steps)
+            if (peakKbps <= step) return step;
+        return Math.Ceiling(peakKbps / 1_000_000.0) * 1_000_000.0;
     }
 
     private sealed record WifiDetails(string Status, string Ssid, string ConnectionType, string SignalStrength);
@@ -349,9 +463,113 @@ public partial class WifiViewModel : ViewModelBase
         return new WifiDetails("Disconnected", "Not connected", "-", "-");
     }
 
-    private void PostResetToDisconnectedState(string adapter)
+    private void PostResetToDisconnectedState(string adapter, NetMode mode, string? title)
     {
-        Dispatcher.UIThread.Post(() => ResetToDisconnectedState(adapter));
+        Dispatcher.UIThread.Post(() =>
+        {
+            ApplyMode(mode, title);
+            ResetToDisconnectedState(adapter);
+            if (mode == NetMode.Ethernet) AdapterNameLabel = adapter;
+        });
+    }
+
+    // Real wired NICs only - never loopback, tunnels, VPNs, bridges, container/VM virtual adapters or
+    // Bluetooth PAN, which operating systems also report as "Ethernet".
+    private static bool IsWiredCandidate(NetworkInterface nic)
+    {
+        if (IsWirelessInterface(nic)) return false;
+
+        switch (nic.NetworkInterfaceType)
+        {
+            case NetworkInterfaceType.Ethernet:
+            case NetworkInterfaceType.GigabitEthernet:
+            case NetworkInterfaceType.FastEthernetT:
+            case NetworkInterfaceType.FastEthernetFx:
+            case NetworkInterfaceType.Ethernet3Megabit:
+                break;
+            default:
+                return false;
+        }
+
+        try
+        {
+            // Linux: everything virtual (docker0, veth*, br-*, virbr*, tun*, wg*, lo, ifb*...) lives here.
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) &&
+                Directory.Exists($"/sys/devices/virtual/net/{nic.Name}"))
+                return false;
+        }
+        catch { }
+
+        string text = (nic.Name + " " + nic.Description).ToLowerInvariant();
+        string[] virtualHints =
+        {
+            "virtual", "vethernet", "vmware", "vmnet", "virtualbox", "vboxnet", "hyper-v", "docker",
+            "veth", "bluetooth", "loopback", "tap-", "tailscale", "wireguard", "zerotier", "vpn",
+            "pseudo", "tunnel", "utun", "awdl", "llw", "bridge"
+        };
+        foreach (var hint in virtualHints)
+            if (text.Contains(hint)) return false;
+
+        return true;
+    }
+
+    private static bool HasIPv4Gateway(NetworkInterface nic)
+    {
+        try
+        {
+            return nic.GetIPProperties().GatewayAddresses.Any(g =>
+                g.Address.AddressFamily == AddressFamily.InterNetwork && !g.Address.Equals(IPAddress.Any));
+        }
+        catch { return false; }
+    }
+
+    // Best connected wired adapter: one with a default gateway first, then the fastest link.
+    private static NetworkInterface? PickWiredInterface(NetworkInterface[] all)
+    {
+        return all
+            .Where(nic => IsWiredCandidate(nic) && nic.OperationalStatus == OperationalStatus.Up)
+            .OrderByDescending(nic => HasIPv4Gateway(nic))
+            .ThenByDescending(nic => { try { return nic.Speed; } catch { return 0L; } })
+            .FirstOrDefault();
+    }
+
+    private static string FormatLinkSpeed(long bitsPerSec)
+    {
+        if (bitsPerSec <= 0) return "-";
+        if (bitsPerSec >= 1_000_000_000L) return $"{Math.Round(bitsPerSec / 1_000_000_000.0, 1)} Gbps";
+        if (bitsPerSec >= 1_000_000L) return $"{Math.Round(bitsPerSec / 1_000_000.0)} Mbps";
+        return $"{Math.Round(bitsPerSec / 1_000.0)} Kbps";
+    }
+
+    // Reuses WifiDetails: "Ssid" carries the Status row and "SignalStrength" carries the Link speed row
+    // (their labels are switched by ApplyMode).
+    private WifiDetails GetEthernetDetails(NetworkInterface nic)
+    {
+        long speed = 0;
+
+        // Linux: sysfs reports the negotiated speed in Mbps (-1 when unknown, e.g. virtual NICs).
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            try
+            {
+                string path = $"/sys/class/net/{nic.Name}/speed";
+                if (File.Exists(path) &&
+                    long.TryParse(File.ReadAllText(path).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out long mbps) &&
+                    mbps > 0)
+                    speed = mbps * 1_000_000L;
+            }
+            catch { }
+        }
+
+        if (speed <= 0)
+        {
+            try { speed = nic.Speed; } catch { }
+        }
+
+        // Virtual or unplugged adapters report -1 / 0xFFFFFFFF Mbps; anything above 400 Gbps isn't a real link.
+        if (speed <= 0 || speed > 400_000_000_000L) speed = 0;
+
+        return new WifiDetails("Connected", "Connected", "Ethernet", FormatLinkSpeed(speed));
     }
 
     private string FormatBitrate(double bitsPerSec)
@@ -361,6 +579,7 @@ public partial class WifiViewModel : ViewModelBase
         if (kbps >= 1000.0)
         {
             double mbps = kbps / 1000.0;
+            if (mbps >= 1000.0) return $"{Math.Round(mbps / 1000.0, 2)} Gbps";
             return $"{Math.Round(mbps, 1)} Mbps";
         }
 
@@ -416,5 +635,7 @@ public partial class WifiViewModel : ViewModelBase
         ReceiveSpeed = "0 Kbps";
         SendValue = 0;
         ReceiveValue = 0;
+        GraphMax = 100;
+        GraphMaxLabel = "100 Kbps";
     }
 }

@@ -156,7 +156,26 @@ public partial class DiskViewModel : ViewModelBase
 
                     // The drive-letter check above is Windows-specific; on Linux the system disk is the one holding "/".
                     if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+                    {
                         SystemDisk = rootDrive.Name == "/" ? "Yes" : "No";
+
+                        // DriveInfo can pick the wrong "/" entry (several mounts can be named "/"), which
+                        // produced "0 GB". Use the physical disk size from sysfs for Capacity, and the
+                        // size of the filesystems actually living on that disk for Formatted.
+                        string? disk = ResolveLinuxDisk();
+                        if (disk != null &&
+                            long.TryParse(ReadSysfs($"/sys/block/{disk}/size"), NumberStyles.Integer, CultureInfo.InvariantCulture, out long sectors512) &&
+                            sectors512 > 0)
+                        {
+                            double diskGB = Math.Round(sectors512 * 512.0 / (1024.0 * 1024.0 * 1024.0), 0);
+                            Capacity = $"{diskGB} GB";
+
+                            long formattedBytes = GetLinuxFormattedBytes(disk);
+                            Formatted = formattedBytes > 0
+                                ? $"{Math.Round(formattedBytes / (1024.0 * 1024.0 * 1024.0), 0)} GB"
+                                : Capacity;
+                        }
+                    }
                 }
 
                 _hardwareInfo.RefreshDriveList();
@@ -313,6 +332,45 @@ public partial class DiskViewModel : ViewModelBase
     {
         try { return File.Exists(path) ? File.ReadAllText(path).Trim() : null; }
         catch { return null; }
+    }
+
+    // Total size of the filesystems mounted from partitions of the given disk. A device mounted several
+    // times (e.g. btrfs subvolumes) is counted once.
+    private long GetLinuxFormattedBytes(string disk)
+    {
+        long total = 0;
+        try
+        {
+            var bestPerDevice = new System.Collections.Generic.Dictionary<string, long>();
+            foreach (var line in File.ReadLines("/proc/mounts"))
+            {
+                var f = line.Split(' ');
+                if (f.Length < 2 || !f[0].StartsWith("/dev/")) continue;
+
+                string dev;
+                try
+                {
+                    var target = new FileInfo(f[0]).ResolveLinkTarget(true);
+                    dev = target != null ? target.Name : Path.GetFileName(f[0]);
+                }
+                catch { dev = Path.GetFileName(f[0]); }
+
+                // Only partitions (or the disk itself) belonging to this disk.
+                if (dev != disk && !Directory.Exists($"/sys/block/{disk}/{dev}")) continue;
+
+                try
+                {
+                    string mountPoint = f[1].Replace("\\040", " ");
+                    long size = new DriveInfo(mountPoint).TotalSize;
+                    if (!bestPerDevice.TryGetValue(dev, out long prev) || size > prev)
+                        bestPerDevice[dev] = size;
+                }
+                catch { }
+            }
+            total = bestPerDevice.Values.Sum();
+        }
+        catch { }
+        return total;
     }
 
     private void LoadLinuxDiskDetails()

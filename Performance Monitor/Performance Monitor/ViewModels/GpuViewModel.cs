@@ -335,6 +335,18 @@ public partial class GpuViewModel : ViewModelBase
 
     private static string FormatMb(double bytes) => $"{Math.Round(bytes / (1024.0 * 1024.0))}";
 
+    // lspci names are long ("Advanced Micro Devices, Inc. [AMD/ATI] Picasso/Raven 2 ... (rev c9)") and get cut
+    // off in the UI, so shorten the vendor prefix and drop the revision suffix.
+    private static string CleanGpuName(string name)
+    {
+        name = System.Text.RegularExpressions.Regex.Replace(name, @"\s*\(rev [0-9a-fA-F]+\)\s*$", "");
+        name = name.Replace("Advanced Micro Devices, Inc. [AMD/ATI]", "AMD")
+                   .Replace("Advanced Micro Devices, Inc.", "AMD")
+                   .Replace("NVIDIA Corporation", "NVIDIA")
+                   .Replace("Intel Corporation", "Intel");
+        return name.Trim();
+    }
+
     private void LoadLinuxSpecs()
     {
         // 1. NVIDIA proprietary driver.
@@ -366,7 +378,7 @@ public partial class GpuViewModel : ViewModelBase
                 string lspciLine = FirstLine(ExecuteCommand("lspci", $"-s {slot}"));
                 // "00:02.0 VGA compatible controller: Intel Corporation ..." -> text after the class.
                 int idx = lspciLine.IndexOf(": ", StringComparison.Ordinal);
-                if (idx >= 0) name = lspciLine.Substring(idx + 2).Trim();
+                if (idx >= 0) name = CleanGpuName(lspciLine.Substring(idx + 2));
             }
 
             if (string.IsNullOrWhiteSpace(name))
@@ -399,7 +411,7 @@ public partial class GpuViewModel : ViewModelBase
             {
                 // Name is the text after "<class>: ", not after the first ':' (which is in the PCI address).
                 int idx = line.IndexOf(": ", StringComparison.Ordinal);
-                GpuName = idx >= 0 ? line.Substring(idx + 2).Trim() : line.Trim();
+                GpuName = idx >= 0 ? CleanGpuName(line.Substring(idx + 2)) : line.Trim();
                 DirectXVersion = "Vulkan / OpenGL";
                 PhysicalLocation = line.Split(' ')[0];
                 break;
